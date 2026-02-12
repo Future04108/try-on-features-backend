@@ -13,6 +13,6 @@ ENV HOST=0.0.0.0
 ENV PORT=${PORT:-8080}
 
 EXPOSE ${PORT}
-CMD ["sh","-c","python -m uvicorn main:app --host ${HOST} --port ${PORT}"]
+CMD ["sh","-c","python -m uvicorn main:app --host ${HOST} --port ${PORT} --limit-max-requests 1000 --timeout-keep-alive 30"]
 
 

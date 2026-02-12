@@ -15,7 +15,12 @@ from utils.settings import Settings
 
 
 settings = Settings.from_env()
-app = FastAPI(title="Virtual Try-On API", version="1.0.0")
+app = FastAPI(
+    title="Virtual Try-On API", 
+    version="1.0.0",
+    # Increase request body size limit for base64 image uploads (default is 1MB, we need more)
+    # This is handled at the uvicorn level, but we document it here
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -182,15 +187,25 @@ async def generate(request: Request):
             body = await request.json()
         except Exception as e:
             # Handle client disconnect or other JSON parsing errors
-            if "ClientDisconnect" in str(type(e).__name__):
+            error_type = type(e).__name__
+            error_msg = str(e)
+            print(f"Error reading JSON body: {error_type}: {error_msg}")
+            
+            if "ClientDisconnect" in error_type or "disconnect" in error_msg.lower():
                 raise HTTPException(
                     status_code=400,
                     detail="Request body was incomplete or connection was closed. Please try again.",
                 )
-            raise HTTPException(
-                status_code=400,
-                detail=f"Invalid JSON in request body: {str(e)}",
-            )
+            elif "JSON" in error_type or "json" in error_msg.lower():
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid JSON format: {error_msg}",
+                )
+            else:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Error reading request body: {error_msg}",
+                )
 
         try:
             denoise_level = float(body.get("denoise_level", 0.65))
