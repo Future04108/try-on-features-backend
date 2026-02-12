@@ -10,9 +10,9 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 COPY . /app
 
 ENV HOST=0.0.0.0
-ENV PORT=8000
+ENV PORT=${PORT:-8080}
 
-EXPOSE 8000
-CMD ["python","-m","uvicorn","main:app","--host","0.0.0.0","--port","8000"]
+EXPOSE ${PORT}
+CMD ["sh","-c","python -m uvicorn main:app --host ${HOST} --port ${PORT}"]
 
 
