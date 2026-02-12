@@ -19,11 +19,10 @@ app = FastAPI(title="Virtual Try-On API", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins
-    allow_credentials=False,  # Must be False when allow_origins is ["*"]
-    allow_methods=["*"],  # Allow all methods
-    allow_headers=["*"],  # Allow all headers
-    expose_headers=["*"],  # Expose all headers to the client
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # Ensure directories exist
@@ -113,22 +112,27 @@ async def generate(request: Request):
       }
     """
     ct = (request.headers.get("content-type") or "").lower()
+    
+    # Log for debugging
+    print(f"Content-Type: {ct}")
+    print(f"Request method: {request.method}")
 
     person_path: Path
     clothing_path: Path
     denoise_level: float
 
+    # Handle multipart/form-data (FormData uploads)
     if "multipart/form-data" in ct:
+        print("Processing as multipart/form-data")
         try:
             form = await request.form()
         except Exception as e:
-            # Log the actual error for debugging
-            import traceback
-            print(f"Multipart parsing error: {e}")
-            print(traceback.format_exc())
+            # If multipart parsing fails, don't try to read JSON - body is already consumed
+            error_msg = str(e)
+            print(f"Multipart parsing error: {type(e).__name__}: {error_msg}")
             raise HTTPException(
                 status_code=400,
-                detail=f'Multipart parsing failed: {str(e)}. Ensure python-multipart is installed.',
+                detail=f'Multipart parsing failed: {error_msg}. Ensure python-multipart is installed.',
             )
 
         try:
@@ -151,17 +155,8 @@ async def generate(request: Request):
         if isinstance(person_up, UploadFile) and isinstance(clothing_up, UploadFile):
             person_path = settings.temp_dir / f"person_{jobs.new_id()}.png"
             clothing_path = settings.temp_dir / f"clothing_{jobs.new_id()}.png"
-            try:
-                await _save_uploadfile_png(person_up, person_path, force_mode="RGB")
-                await _save_uploadfile_png(clothing_up, clothing_path, force_mode="RGBA")
-            except Exception as e:
-                import traceback
-                print(f"Error saving uploaded files: {e}")
-                print(traceback.format_exc())
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"Failed to save uploaded images: {str(e)}",
-                )
+            await _save_uploadfile_png(person_up, person_path, force_mode="RGB")
+            await _save_uploadfile_png(clothing_up, clothing_path, force_mode="RGBA")
         else:
             person_image_path = form.get("person_image_path")
             clothing_image_path = form.get("clothing_image_path")
@@ -180,9 +175,28 @@ async def generate(request: Request):
         job_id = jobs.create_job(person_path=person_path, clothing_path=clothing_path, denoise=denoise_level)
         return {"job_id": job_id}
 
+    # Handle application/json
     if "application/json" in ct:
-        body = await request.json()
-        denoise_level = float(body.get("denoise_level", 0.65))
+        print("Processing as application/json")
+        try:
+            body = await request.json()
+        except Exception as e:
+            # Handle client disconnect or other JSON parsing errors
+            if "ClientDisconnect" in str(type(e).__name__):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Request body was incomplete or connection was closed. Please try again.",
+                )
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid JSON in request body: {str(e)}",
+            )
+
+        try:
+            denoise_level = float(body.get("denoise_level", 0.65))
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=400, detail="denoise_level must be a valid number")
+        
         if denoise_level not in (0.50, 0.65, 0.75):
             raise HTTPException(status_code=400, detail="denoise_level must be one of 0.50, 0.65, 0.75")
 
@@ -211,7 +225,8 @@ async def generate(request: Request):
         job_id = jobs.create_job(person_path=person_path, clothing_path=clothing_path, denoise=denoise_level)
         return {"job_id": job_id}
 
-    raise HTTPException(status_code=415, detail="Unsupported content-type. Use multipart/form-data or application/json.")
+    print(f"Unsupported content-type: {ct}")
+    raise HTTPException(status_code=415, detail=f"Unsupported content-type: {ct}. Use multipart/form-data or application/json.")
 
 
 
@@ -254,27 +269,15 @@ def _decode_b64_image(b64: str) -> Image.Image:
 
 
 async def _save_uploadfile_png(up: UploadFile, dest: Path, force_mode: str) -> None:
+    data = await up.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="Empty upload")
     try:
-        data = await up.read()
-        if not data:
-            raise HTTPException(status_code=400, detail=f"Empty upload for {up.filename or 'file'}")
-        
-        try:
-            img = Image.open(io.BytesIO(data))
-            img = ImageOps.exif_transpose(img)
-            img = img.convert(force_mode)
-            img.save(dest, format="PNG", optimize=True)
-        except Exception as img_err:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Invalid image format for {up.filename or 'file'}: {str(img_err)}"
-            )
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to process upload {up.filename or 'file'}: {str(e)}"
-        )
+        img = Image.open(io.BytesIO(data))
+        img = ImageOps.exif_transpose(img)
+        img = img.convert(force_mode)
+        img.save(dest, format="PNG", optimize=True)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid image upload")
 
 
