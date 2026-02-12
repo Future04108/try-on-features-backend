@@ -18,13 +18,14 @@ from utils.settings import Settings
 settings = Settings.from_env()
 app = FastAPI(title="Virtual Try-On API", version="1.0.0")
 
-# Wide‑open CORS for development (Caddy still enforces its own auth in front)
+# CORS: wide open for development; Caddy still handles auth.
+# This does not impose body-size limits – those are controlled by uvicorn/server.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=False,  # must be False when origins="*"
+    allow_credentials=False,  # must be False when allow_origins=["*"]
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=["*"],      # includes Authorization and any custom headers
 )
 
 # Ensure directories exist
@@ -38,7 +39,6 @@ jobs = JobManager(settings=settings)
 
 @app.get("/health")
 def health() -> dict:
-    # Simple public health endpoint
     return {"status": "healthy"}
 
 
@@ -61,7 +61,15 @@ async def upload(request: Request):
 
     if "multipart/form-data" in ct:
         try:
+            print("[/upload] reading multipart form…")
             form = await request.form()
+            print("[/upload] form read complete")
+        except ClientDisconnect:
+            print("[/upload] ClientDisconnect while reading multipart body")
+            return {
+                "status": "cancelled",
+                "message": "Upload cancelled due to disconnection - try smaller images or a faster connection",
+            }
         except Exception:
             raise HTTPException(
                 status_code=400,
@@ -101,7 +109,7 @@ async def generate(request: Request):
     """
     Start a background try-on generation job.
 
-    Accepts JSON (recommended; no python-multipart dependency):
+    Accepts JSON:
       {
         "denoise_level": 0.65,
         "person_image_b64": "...",
@@ -116,7 +124,6 @@ async def generate(request: Request):
     """
     ct = (request.headers.get("content-type") or "").lower()
 
-    # Debug logging for networking issues
     print("---- /generate request ----")
     print("Client:", request.client)
     try:
@@ -130,15 +137,20 @@ async def generate(request: Request):
 
     # multipart/form-data (FormData uploads)
     if "multipart/form-data" in ct:
-        print("Processing as multipart/form-data")
+        print("[/generate] Processing as multipart/form-data")
         try:
+            print("[/generate] reading multipart form…")
             form = await request.form()
+            print("[/generate] form read complete")
         except ClientDisconnect:
-            print("ClientDisconnect while reading multipart body")
-            return {"status": "cancelled"}
+            print("[/generate] ClientDisconnect while reading multipart body")
+            return {
+                "status": "cancelled",
+                "message": "Upload cancelled due to disconnection - try smaller images or a faster connection",
+            }
         except Exception as e:
             msg = str(e)
-            print("Multipart parsing error:", type(e).__name__, msg)
+            print("[/generate] multipart parsing error:", type(e).__name__, msg)
             raise HTTPException(
                 status_code=400,
                 detail=f'Multipart parsing failed: {msg}. Ensure python-multipart is installed.',
@@ -156,11 +168,27 @@ async def generate(request: Request):
         if not person_up or not clothing_up:
             raise HTTPException(status_code=400, detail="Missing person_image or clothing_image in form data")
 
+        # Read & log body size per-upload (this also tolerates slow connections)
+        async def save_with_size(label: str, up: UploadFile, dest: Path, force_mode: str):
+            print(f"[/generate] reading file {label}: {up.filename!r}")
+            data = await up.read()
+            size = len(data or b"")
+            print(f"[/generate] read {size} bytes for {label}")
+            if not data:
+                raise HTTPException(status_code=400, detail=f"Empty upload for {label}")
+            try:
+                img = Image.open(io.BytesIO(data))
+                img = ImageOps.exif_transpose(img)
+                img = img.convert(force_mode)
+                img.save(dest, format="PNG", optimize=True)
+            except Exception:
+                raise HTTPException(status_code=400, detail=f"Invalid image upload for {label}")
+
         if isinstance(person_up, UploadFile) and isinstance(clothing_up, UploadFile):
             person_path = settings.temp_dir / f"person_{jobs.new_id()}.png"
             clothing_path = settings.temp_dir / f"clothing_{jobs.new_id()}.png"
-            await _save_uploadfile_png(person_up, person_path, force_mode="RGB")
-            await _save_uploadfile_png(clothing_up, clothing_path, force_mode="RGBA")
+            await save_with_size("person_image", person_up, person_path, "RGB")
+            await save_with_size("clothing_image", clothing_up, clothing_path, "RGBA")
         else:
             person_image_path = form.get("person_image_path")
             clothing_image_path = form.get("clothing_image_path")
@@ -181,15 +209,21 @@ async def generate(request: Request):
 
     # application/json (base64 or paths)
     if "application/json" in ct:
-        print("Processing as application/json")
+        print("[/generate] Processing as application/json")
         try:
+            print("[/generate] reading JSON body…")
             body = await request.json()
+            raw = await request.body()
+            print("[/generate] JSON body size:", len(raw or b""))
         except ClientDisconnect:
-            print("ClientDisconnect while reading JSON body")
-            return {"status": "cancelled"}
+            print("[/generate] ClientDisconnect while reading JSON body")
+            return {
+                "status": "cancelled",
+                "message": "Upload cancelled due to disconnection - try smaller images or a faster connection",
+            }
         except Exception as e:
             msg = str(e)
-            print("Error reading JSON body:", type(e).__name__, msg)
+            print("[/generate] error reading JSON body:", type(e).__name__, msg)
             raise HTTPException(status_code=400, detail=f"Error reading request body: {msg}")
 
         try:
@@ -224,7 +258,7 @@ async def generate(request: Request):
         job_id = jobs.create_job(person_path=person_path, clothing_path=clothing_path, denoise=denoise_level)
         return {"job_id": job_id}
 
-    print("Unsupported content-type for /generate:", ct)
+    print("[/generate] Unsupported content-type:", ct)
     raise HTTPException(status_code=415, detail="Unsupported content-type. Use multipart/form-data or application/json.")
 
 
@@ -252,16 +286,3 @@ def _decode_b64_image(b64: str) -> Image.Image:
         return img
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid base64 image")
-
-
-async def _save_uploadfile_png(up: UploadFile, dest: Path, force_mode: str) -> None:
-    data = await up.read()
-    if not data:
-        raise HTTPException(status_code=400, detail="Empty upload")
-    try:
-        img = Image.open(io.BytesIO(data))
-        img = ImageOps.exif_transpose(img)
-        img = img.convert(force_mode)
-        img.save(dest, format="PNG", optimize=True)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid image upload")
