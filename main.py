@@ -121,24 +121,47 @@ async def generate(request: Request):
     if "multipart/form-data" in ct:
         try:
             form = await request.form()
-        except Exception:
+        except Exception as e:
+            # Log the actual error for debugging
+            import traceback
+            print(f"Multipart parsing error: {e}")
+            print(traceback.format_exc())
             raise HTTPException(
                 status_code=400,
-                detail='Multipart parsing unavailable (missing "python-multipart"). Use JSON base64 instead.',
+                detail=f'Multipart parsing failed: {str(e)}. Ensure python-multipart is installed.',
             )
 
-        denoise_level = float(form.get("denoise_level", 0.65))
+        try:
+            denoise_level = float(form.get("denoise_level", 0.65))
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=400, detail="denoise_level must be a valid number")
+        
         if denoise_level not in (0.50, 0.65, 0.75):
             raise HTTPException(status_code=400, detail="denoise_level must be one of 0.50, 0.65, 0.75")
 
         person_up = form.get("person_image")
         clothing_up = form.get("clothing_image")
 
+        if not person_up or not clothing_up:
+            raise HTTPException(
+                status_code=400,
+                detail="Missing person_image or clothing_image in form data",
+            )
+
         if isinstance(person_up, UploadFile) and isinstance(clothing_up, UploadFile):
             person_path = settings.temp_dir / f"person_{jobs.new_id()}.png"
             clothing_path = settings.temp_dir / f"clothing_{jobs.new_id()}.png"
-            await _save_uploadfile_png(person_up, person_path, force_mode="RGB")
-            await _save_uploadfile_png(clothing_up, clothing_path, force_mode="RGBA")
+            try:
+                await _save_uploadfile_png(person_up, person_path, force_mode="RGB")
+                await _save_uploadfile_png(clothing_up, clothing_path, force_mode="RGBA")
+            except Exception as e:
+                import traceback
+                print(f"Error saving uploaded files: {e}")
+                print(traceback.format_exc())
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Failed to save uploaded images: {str(e)}",
+                )
         else:
             person_image_path = form.get("person_image_path")
             clothing_image_path = form.get("clothing_image_path")
@@ -231,15 +254,27 @@ def _decode_b64_image(b64: str) -> Image.Image:
 
 
 async def _save_uploadfile_png(up: UploadFile, dest: Path, force_mode: str) -> None:
-    data = await up.read()
-    if not data:
-        raise HTTPException(status_code=400, detail="Empty upload")
     try:
-        img = Image.open(io.BytesIO(data))
-        img = ImageOps.exif_transpose(img)
-        img = img.convert(force_mode)
-        img.save(dest, format="PNG", optimize=True)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid image upload")
+        data = await up.read()
+        if not data:
+            raise HTTPException(status_code=400, detail=f"Empty upload for {up.filename or 'file'}")
+        
+        try:
+            img = Image.open(io.BytesIO(data))
+            img = ImageOps.exif_transpose(img)
+            img = img.convert(force_mode)
+            img.save(dest, format="PNG", optimize=True)
+        except Exception as img_err:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid image format for {up.filename or 'file'}: {str(img_err)}"
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to process upload {up.filename or 'file'}: {str(e)}"
+        )
 
 
