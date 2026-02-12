@@ -9,23 +9,20 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageOps
 from starlette.datastructures import UploadFile
+from starlette.requests import ClientDisconnect
 
 from utils.jobs import JobManager
 from utils.settings import Settings
 
 
 settings = Settings.from_env()
-app = FastAPI(
-    title="Virtual Try-On API", 
-    version="1.0.0",
-    # Increase request body size limit for base64 image uploads (default is 1MB, we need more)
-    # This is handled at the uvicorn level, but we document it here
-)
+app = FastAPI(title="Virtual Try-On API", version="1.0.0")
 
+# Wide‑open CORS for development (Caddy still enforces its own auth in front)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,  # must be False when origins="*"
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -40,8 +37,9 @@ jobs = JobManager(settings=settings)
 
 
 @app.get("/health")
-def health():
-    return {"ok": True}
+def health() -> dict:
+    # Simple public health endpoint
+    return {"status": "healthy"}
 
 
 @app.post("/upload")
@@ -117,45 +115,46 @@ async def generate(request: Request):
       }
     """
     ct = (request.headers.get("content-type") or "").lower()
-    
-    # Log for debugging
-    print(f"Content-Type: {ct}")
-    print(f"Request method: {request.method}")
+
+    # Debug logging for networking issues
+    print("---- /generate request ----")
+    print("Client:", request.client)
+    try:
+        print("Headers:", dict(request.headers))
+    except Exception:
+        pass
 
     person_path: Path
     clothing_path: Path
     denoise_level: float
 
-    # Handle multipart/form-data (FormData uploads)
+    # multipart/form-data (FormData uploads)
     if "multipart/form-data" in ct:
         print("Processing as multipart/form-data")
         try:
             form = await request.form()
+        except ClientDisconnect:
+            print("ClientDisconnect while reading multipart body")
+            return {"status": "cancelled"}
         except Exception as e:
-            # If multipart parsing fails, don't try to read JSON - body is already consumed
-            error_msg = str(e)
-            print(f"Multipart parsing error: {type(e).__name__}: {error_msg}")
+            msg = str(e)
+            print("Multipart parsing error:", type(e).__name__, msg)
             raise HTTPException(
                 status_code=400,
-                detail=f'Multipart parsing failed: {error_msg}. Ensure python-multipart is installed.',
+                detail=f'Multipart parsing failed: {msg}. Ensure python-multipart is installed.',
             )
 
         try:
             denoise_level = float(form.get("denoise_level", 0.65))
         except (ValueError, TypeError):
             raise HTTPException(status_code=400, detail="denoise_level must be a valid number")
-        
         if denoise_level not in (0.50, 0.65, 0.75):
             raise HTTPException(status_code=400, detail="denoise_level must be one of 0.50, 0.65, 0.75")
 
         person_up = form.get("person_image")
         clothing_up = form.get("clothing_image")
-
         if not person_up or not clothing_up:
-            raise HTTPException(
-                status_code=400,
-                detail="Missing person_image or clothing_image in form data",
-            )
+            raise HTTPException(status_code=400, detail="Missing person_image or clothing_image in form data")
 
         if isinstance(person_up, UploadFile) and isinstance(clothing_up, UploadFile):
             person_path = settings.temp_dir / f"person_{jobs.new_id()}.png"
@@ -180,38 +179,23 @@ async def generate(request: Request):
         job_id = jobs.create_job(person_path=person_path, clothing_path=clothing_path, denoise=denoise_level)
         return {"job_id": job_id}
 
-    # Handle application/json
+    # application/json (base64 or paths)
     if "application/json" in ct:
         print("Processing as application/json")
         try:
             body = await request.json()
+        except ClientDisconnect:
+            print("ClientDisconnect while reading JSON body")
+            return {"status": "cancelled"}
         except Exception as e:
-            # Handle client disconnect or other JSON parsing errors
-            error_type = type(e).__name__
-            error_msg = str(e)
-            print(f"Error reading JSON body: {error_type}: {error_msg}")
-            
-            if "ClientDisconnect" in error_type or "disconnect" in error_msg.lower():
-                raise HTTPException(
-                    status_code=400,
-                    detail="Request body was incomplete or connection was closed. Please try again.",
-                )
-            elif "JSON" in error_type or "json" in error_msg.lower():
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Invalid JSON format: {error_msg}",
-                )
-            else:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Error reading request body: {error_msg}",
-                )
+            msg = str(e)
+            print("Error reading JSON body:", type(e).__name__, msg)
+            raise HTTPException(status_code=400, detail=f"Error reading request body: {msg}")
 
         try:
             denoise_level = float(body.get("denoise_level", 0.65))
         except (ValueError, TypeError):
             raise HTTPException(status_code=400, detail="denoise_level must be a valid number")
-        
         if denoise_level not in (0.50, 0.65, 0.75):
             raise HTTPException(status_code=400, detail="denoise_level must be one of 0.50, 0.65, 0.75")
 
@@ -240,9 +224,8 @@ async def generate(request: Request):
         job_id = jobs.create_job(person_path=person_path, clothing_path=clothing_path, denoise=denoise_level)
         return {"job_id": job_id}
 
-    print(f"Unsupported content-type: {ct}")
-    raise HTTPException(status_code=415, detail=f"Unsupported content-type: {ct}. Use multipart/form-data or application/json.")
-
+    print("Unsupported content-type for /generate:", ct)
+    raise HTTPException(status_code=415, detail="Unsupported content-type. Use multipart/form-data or application/json.")
 
 
 @app.get("/jobs/{job_id}")
@@ -259,19 +242,7 @@ async def unhandled_exception_handler(_, exc: Exception):
     return JSONResponse(status_code=500, content={"detail": f"Internal error: {type(exc).__name__}"})
 
 
-def _ext(filename: str) -> str:
-    if not filename:
-        return ".png"
-    ext = os.path.splitext(filename)[1].lower()
-    return ext if ext in (".jpg", ".jpeg", ".png") else ".png"
-
 def _decode_b64_image(b64: str) -> Image.Image:
-    """
-    Accepts either:
-      - raw base64
-      - data URL: data:image/png;base64,<...>
-    Returns a PIL image with EXIF orientation applied.
-    """
     if "," in b64 and b64.strip().lower().startswith("data:"):
         b64 = b64.split(",", 1)[1]
     try:
@@ -294,5 +265,3 @@ async def _save_uploadfile_png(up: UploadFile, dest: Path, force_mode: str) -> N
         img.save(dest, format="PNG", optimize=True)
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid image upload")
-
-
